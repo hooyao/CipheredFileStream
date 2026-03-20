@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CipheredFileStream/CipheredFileStream.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CipheredFileStream.Tests/CipheredFileStream.Tests.csproj" />
+  </Folder>
+</Solution>

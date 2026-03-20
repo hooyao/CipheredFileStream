@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+option csharp_namespace = "CipheredFileStream.Proto";
+
+message FileHeader {
+  ChunkSize chunk_size = 1;
+  uint64 plaintext_length = 2;
+  uint32 chunk_count = 3;
+  bytes master_nonce = 4;
+  KeyInfo key_info = 5;
+  bytes total_checksum = 6;
+}
+
+enum ChunkSize {
+  CHUNK_SIZE_4K = 0;
+  CHUNK_SIZE_8K = 1;
+  CHUNK_SIZE_16K = 2;
+  CHUNK_SIZE_32K = 3;
+  CHUNK_SIZE_64K = 4;
+  CHUNK_SIZE_128K = 5;
+}
+
+message KeyInfo {
+  KeyDerivation method = 1;
+  bytes salt = 2;
+  uint32 iterations = 3;
+}
+
+enum KeyDerivation {
+  KEY_DERIVATION_NONE = 0;
+  KEY_DERIVATION_PBKDF2 = 1;
+}
