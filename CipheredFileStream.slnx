@@ -3,6 +3,6 @@
     <Project Path="src/CipheredFileStream/CipheredFileStream.csproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/CipheredFileStream.Tests/CipheredFileStream.Tests.csproj" />
+    <Project Path="tests/CipheredFileStream.Test/CipheredFileStream.Test.csproj" />
   </Folder>
 </Solution>
