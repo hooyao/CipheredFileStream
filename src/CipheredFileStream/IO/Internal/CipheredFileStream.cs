@@ -149,6 +149,12 @@ internal sealed class CipheredFileStream : Stream
                 throw new ArgumentOutOfRangeException(nameof(value), "Position cannot be negative.");
             }
 
+            // Flush pending write data before changing position (same as Seek).
+            if (_writeBuffer != null && _writeBuffer.HasPendingData)
+            {
+                FlushAndResetBuffers();
+            }
+
             _position = value;
         }
     }
@@ -343,14 +349,14 @@ internal sealed class CipheredFileStream : Stream
     /// </summary>
     private void WriteHeader()
     {
-        // Ensure block 0 exists — it might not after SetLength(0)
+        // Ensure block 0 exists
         bool isNewBlock = _blockCount == 0;
         if (isNewBlock)
-        {
             _blockCount = 1;
-            // File may have been truncated to 0 bytes; re-write cleartext header
-            WriteCleartextHeader();
-        }
+
+        // Always write the cleartext header (32 bytes at offset 0).
+        // Cheap and ensures header is present after truncate-to-zero scenarios.
+        WriteCleartextHeader();
 
         _blockManager.EnsureBlock(0, isNewBlock: isNewBlock);
 
@@ -797,6 +803,13 @@ internal sealed class CipheredFileStream : Stream
         // Truncate underlying file
         long physicalLength = (long)newBlockCount * _layout.BlockSize;
         _underlyingStream.SetLength(physicalLength);
+
+        // If truncated to 0 blocks, ensure cleartext header will be rewritten
+        // when the next write or Flush/Dispose creates block 0.
+        if (newBlockCount == 0)
+        {
+            _integrityTracker.Reset();
+        }
 
         // Adjust position if beyond new length
         if (_position > _cleartextLength)
