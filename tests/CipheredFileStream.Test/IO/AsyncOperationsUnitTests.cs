@@ -493,7 +493,7 @@ public class AsyncOperationsUnitTests : CryptoTestBase
         cts.Cancel();
 
         var buf = new byte[100];
-        Func<Task> act = async () => await stream.ReadAsync(buf.AsMemory(0, 100), cts.Token);
+        Func<Task> act = async () => await stream.ReadExactlyAsync(buf.AsMemory(0, 100), cts.Token);
         await act.Should().ThrowAsync<OperationCanceledException>();
     }
 

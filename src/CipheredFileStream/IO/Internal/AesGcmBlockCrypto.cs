@@ -49,7 +49,11 @@ internal sealed class AesGcmBlockCrypto : IBlockCrypto
         _nonce.CopyTo(ciphertext.AsSpan(ciphertextOffset));
 
         // 3. AES-GCM encrypt
+#if NET7_0_OR_GREATER
         using var aesGcm = new AesGcm(key, TagSize);
+#else
+        using var aesGcm = new AesGcm(key);
+#endif
         aesGcm.Encrypt(
             _nonce,
             plaintext.AsSpan(plaintextOffset, plaintextCount),
@@ -88,7 +92,11 @@ internal sealed class AesGcmBlockCrypto : IBlockCrypto
         // 3. Decrypt and authenticate
         try
         {
+#if NET7_0_OR_GREATER
             using var aesGcm = new AesGcm(key, TagSize);
+#else
+            using var aesGcm = new AesGcm(key);
+#endif
             aesGcm.Decrypt(
                 _nonce,
                 ciphertext.AsSpan(ciphertextOffset + NonceSize, payloadSize),
@@ -116,7 +124,7 @@ internal sealed class AesGcmBlockCrypto : IBlockCrypto
 
     public void Dispose()
     {
-        Array.Clear(_nonce);
-        Array.Clear(_tag);
+        Array.Clear(_nonce, 0, _nonce.Length);
+        Array.Clear(_tag, 0, _tag.Length);
     }
 }

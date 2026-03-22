@@ -71,7 +71,7 @@ public class SetLengthTests : CryptoTestBase
         using var stream = _factory.Create(path, FileMode.Open, FileAccess.Read, options);
         stream.Length.Should().Be(100);
         var buf = new byte[100];
-        stream.Read(buf, 0, 100);
+        stream.ReadExactly(buf, 0, 100);
 
         // First 3 bytes are original data
         buf[0].Should().Be(1);

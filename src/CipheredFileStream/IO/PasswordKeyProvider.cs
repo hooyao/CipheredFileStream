@@ -32,10 +32,16 @@ public sealed class PasswordKeyProvider : IKeyProvider
         if (iterations < 1)
             throw new ArgumentOutOfRangeException(nameof(iterations));
 
-        Salt = RandomNumberGenerator.GetBytes(EncryptedFileFormat.SaltSize);
+        Salt = new byte[EncryptedFileFormat.SaltSize];
+        RandomNumberGenerator.Fill(Salt);
         Iterations = (uint)iterations;
+#if NET6_0_OR_GREATER
         _key = Rfc2898DeriveBytes.Pbkdf2(
             password, Salt, iterations, HashAlgorithmName.SHA256, EncryptedFileFormat.KeySize);
+#else
+        using (var pbkdf2 = new Rfc2898DeriveBytes(password.ToString(), Salt, iterations, HashAlgorithmName.SHA256))
+            _key = pbkdf2.GetBytes(EncryptedFileFormat.KeySize);
+#endif
     }
 
     /// <summary>
@@ -48,7 +54,7 @@ public sealed class PasswordKeyProvider : IKeyProvider
     {
         if (password.IsEmpty)
             throw new ArgumentException("Password cannot be empty.", nameof(password));
-        ArgumentNullException.ThrowIfNull(salt);
+        ThrowHelper.ThrowIfNull(salt, nameof(salt));
         if (salt.Length != EncryptedFileFormat.SaltSize)
             throw new ArgumentException($"Salt must be {EncryptedFileFormat.SaltSize} bytes.", nameof(salt));
         if (iterations < 1)
@@ -56,13 +62,18 @@ public sealed class PasswordKeyProvider : IKeyProvider
 
         Salt = (byte[])salt.Clone();
         Iterations = iterations;
+#if NET6_0_OR_GREATER
         _key = Rfc2898DeriveBytes.Pbkdf2(
             password, Salt, (int)iterations, HashAlgorithmName.SHA256, EncryptedFileFormat.KeySize);
+#else
+        using (var pbkdf2 = new Rfc2898DeriveBytes(password.ToString(), Salt, (int)iterations, HashAlgorithmName.SHA256))
+            _key = pbkdf2.GetBytes(EncryptedFileFormat.KeySize);
+#endif
     }
 
     public byte[] GetKey()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
         return _key!;
     }
 
@@ -72,7 +83,7 @@ public sealed class PasswordKeyProvider : IKeyProvider
         {
             if (_key is not null)
             {
-                Array.Clear(_key);
+                Array.Clear(_key, 0, _key.Length);
                 _key = null;
             }
             _disposed = true;

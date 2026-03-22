@@ -63,7 +63,7 @@ public class RandomAccessTests : CryptoTestBase
         using (var s = _factory.Create(path, FileMode.Open, FileAccess.Read, options))
         {
             var buf = new byte[1000];
-            s.Read(buf, 0, 1000);
+            s.ReadExactly(buf, 0, 1000);
 
             for (int i = 0; i < 500; i++)
                 buf[i].Should().Be(0);
@@ -76,7 +76,7 @@ public class RandomAccessTests : CryptoTestBase
 
     [Theory]
     [MemberData(nameof(AllBlockSizes))]
-    public void AsyncReadWrite_RoundTrips(BlockSizeOption blockSize)
+    public async Task AsyncReadWrite_RoundTrips(BlockSizeOption blockSize)
     {
         var path = GetTestFilePath($"async_{blockSize}.enc");
         var options = new CipheredFileStreamOptions { BlockSize = blockSize };
@@ -84,8 +84,8 @@ public class RandomAccessTests : CryptoTestBase
 
         using (var s = _factory.Create(path, FileMode.Create, options))
         {
-            s.WriteAsync(data, 0, data.Length).Wait();
-            s.FlushAsync().Wait();
+            await s.WriteAsync(data, 0, data.Length);
+            await s.FlushAsync();
         }
 
         var readBack = new byte[data.Length];
@@ -94,7 +94,7 @@ public class RandomAccessTests : CryptoTestBase
             int totalRead = 0;
             while (totalRead < readBack.Length)
             {
-                int r = s.ReadAsync(readBack, totalRead, readBack.Length - totalRead).Result;
+                int r = await s.ReadAsync(readBack, totalRead, readBack.Length - totalRead);
                 if (r == 0) break;
                 totalRead += r;
             }

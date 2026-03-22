@@ -28,7 +28,7 @@ public class CorruptionDetectionTests : CryptoTestBase
         {
             using var stream = _factory.Create(path, FileMode.Open, FileAccess.Read, options);
             var buf = new byte[1000];
-            stream.Read(buf, 0, 1000);
+            stream.ReadExactly(buf, 0, 1000);
         };
         act.Should().Throw<EncryptedFileCorruptException>();
     }
@@ -99,7 +99,7 @@ public class CorruptionDetectionTests : CryptoTestBase
         {
             using var stream = _factory.Create(path, FileMode.Open, FileAccess.Read, options);
             var buf = new byte[1024];
-            stream.Read(buf, 0, buf.Length);
+            stream.ReadExactly(buf, 0, buf.Length);
         };
         act.Should().Throw<EncryptedFileCorruptException>();
     }
@@ -164,7 +164,7 @@ public class CorruptionDetectionTests : CryptoTestBase
         {
             using var stream = _factory.Create(path, FileMode.Open, FileAccess.Read, options);
             var buf = new byte[1024];
-            stream.Read(buf, 0, buf.Length);
+            stream.ReadExactly(buf, 0, buf.Length);
         };
         act.Should().Throw<Exception>();
     }

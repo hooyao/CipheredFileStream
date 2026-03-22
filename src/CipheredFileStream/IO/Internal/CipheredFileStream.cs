@@ -128,7 +128,7 @@ internal sealed class CipheredFileStream : Stream
     {
         get
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowHelper.ThrowIfDisposed(_disposed, this);
             return _cleartextLength;
         }
     }
@@ -138,12 +138,12 @@ internal sealed class CipheredFileStream : Stream
     {
         get
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowHelper.ThrowIfDisposed(_disposed, this);
             return _position;
         }
         set
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowHelper.ThrowIfDisposed(_disposed, this);
             if (value < 0)
             {
                 throw new ArgumentOutOfRangeException(nameof(value), "Position cannot be negative.");
@@ -211,7 +211,12 @@ internal sealed class CipheredFileStream : Stream
 
         // Bytes 28-31 are reserved (zeros)
 
+#if NET6_0_OR_GREATER
         _underlyingStream.Write(header);
+#else
+        var headerArray = header.ToArray();
+        _underlyingStream.Write(headerArray, 0, headerArray.Length);
+#endif
     }
 
     /// <summary>
@@ -222,8 +227,9 @@ internal sealed class CipheredFileStream : Stream
         _underlyingStream.Position = 0;
 
         // Read cleartext header
-        Span<byte> cleartextHeader = stackalloc byte[EncryptedFileFormat.CleartextHeaderSize];
-        int bytesRead = _underlyingStream.Read(cleartextHeader);
+        var cleartextHeaderArray = new byte[EncryptedFileFormat.CleartextHeaderSize];
+        int bytesRead = _underlyingStream.Read(cleartextHeaderArray, 0, cleartextHeaderArray.Length);
+        Span<byte> cleartextHeader = cleartextHeaderArray;
 
         if (bytesRead < EncryptedFileFormat.CleartextHeaderSize)
         {
@@ -441,6 +447,7 @@ internal sealed class CipheredFileStream : Stream
         return Task.FromResult(Read(buffer, offset, count));
     }
 
+#if NET6_0_OR_GREATER
     /// <inheritdoc/>
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
@@ -459,17 +466,18 @@ internal sealed class CipheredFileStream : Stream
             return ValueTask.FromResult(read);
         }
     }
+#endif
 
     private void ValidateReadArguments(byte[] buffer, int offset, int count)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
 
         if (!_canRead)
         {
             throw new NotSupportedException("Stream does not support reading.");
         }
 
-        ArgumentNullException.ThrowIfNull(buffer);
+        ThrowHelper.ThrowIfNull(buffer, nameof(buffer));
 
         if (offset < 0)
         {
@@ -601,6 +609,7 @@ internal sealed class CipheredFileStream : Stream
         return Task.CompletedTask;
     }
 
+#if NET6_0_OR_GREATER
     /// <inheritdoc/>
     public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
@@ -617,6 +626,7 @@ internal sealed class CipheredFileStream : Stream
         }
         return ValueTask.CompletedTask;
     }
+#endif
 
     /// <summary>
     /// Fills a gap in the file with zeros (BlockManager path).
@@ -638,14 +648,14 @@ internal sealed class CipheredFileStream : Stream
 
     private void ValidateWriteArguments(byte[] buffer, int offset, int count)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
 
         if (!_canWrite)
         {
             throw new NotSupportedException("Stream does not support writing.");
         }
 
-        ArgumentNullException.ThrowIfNull(buffer);
+        ThrowHelper.ThrowIfNull(buffer, nameof(buffer));
 
         if (offset < 0)
         {
@@ -716,7 +726,7 @@ internal sealed class CipheredFileStream : Stream
     /// <inheritdoc/>
     public override long Seek(long offset, SeekOrigin origin)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
 
         long newPosition = origin switch
         {
@@ -744,7 +754,7 @@ internal sealed class CipheredFileStream : Stream
     /// <inheritdoc/>
     public override void SetLength(long value)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
 
         if (!_canWrite)
         {
@@ -831,7 +841,7 @@ internal sealed class CipheredFileStream : Stream
     /// <inheritdoc/>
     public override void Flush()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
 
         // Flush write-behind buffer if active
         if (_writeBuffer != null)
@@ -895,7 +905,7 @@ internal sealed class CipheredFileStream : Stream
                 _writeBuffer?.Dispose();
                 _blockManager?.Dispose();
                 _underlyingStream.Dispose();
-                Array.Clear(_key);
+                Array.Clear(_key, 0, _key.Length);
             }
         }
         else
@@ -906,6 +916,7 @@ internal sealed class CipheredFileStream : Stream
         base.Dispose(disposing);
     }
 
+#if NET6_0_OR_GREATER
     /// <inheritdoc/>
     public override async ValueTask DisposeAsync()
     {
@@ -928,10 +939,11 @@ internal sealed class CipheredFileStream : Stream
             _writeBuffer?.Dispose();
             _blockManager?.Dispose();
             await _underlyingStream.DisposeAsync();
-            Array.Clear(_key);
+            Array.Clear(_key, 0, _key.Length);
             GC.SuppressFinalize(this);
         }
     }
+#endif
 
     #endregion
 }

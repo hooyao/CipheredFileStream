@@ -44,7 +44,7 @@ public class EnduranceTests : IDisposable
 
     [Trait("Category", "Endurance")]
     [Fact]
-    public void EncryptDecryptVerify_Endurance()
+    public async Task EncryptDecryptVerify_Endurance()
     {
         _output.WriteLine(_budget.FormatSummary());
 
@@ -129,7 +129,7 @@ public class EnduranceTests : IDisposable
             Interlocked.Add(ref failures, localFailures);
         })).ToArray();
 
-        Task.WaitAll(tasks);
+        await Task.WhenAll(tasks);
         sw.Stop();
 
         _output.WriteLine($"Completed in {sw.Elapsed.TotalSeconds:F1}s");
@@ -143,7 +143,7 @@ public class EnduranceTests : IDisposable
 
     [Trait("Category", "Endurance")]
     [Fact]
-    public void FileStreamParity_Endurance()
+    public async Task FileStreamParity_Endurance()
     {
         _output.WriteLine(_budget.FormatSummary());
 
@@ -286,7 +286,7 @@ public class EnduranceTests : IDisposable
             Interlocked.Add(ref mismatches, localMismatches);
         })).ToArray();
 
-        Task.WaitAll(tasks);
+        await Task.WhenAll(tasks);
         sw.Stop();
 
         _output.WriteLine($"Completed in {sw.Elapsed.TotalSeconds:F1}s");

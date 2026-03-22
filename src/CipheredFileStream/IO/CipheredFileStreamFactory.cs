@@ -25,7 +25,7 @@ public sealed class CipheredFileStreamFactory : ICipheredStreamFactory
     /// <exception cref="ArgumentException"><paramref name="key"/> is not 32 bytes.</exception>
     public CipheredFileStreamFactory(byte[] key)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ThrowHelper.ThrowIfNull(key, nameof(key));
         if (key.Length != EncryptedFileFormat.KeySize)
             throw new ArgumentException(
                 $"Key must be exactly {EncryptedFileFormat.KeySize} bytes.", nameof(key));
@@ -42,7 +42,7 @@ public sealed class CipheredFileStreamFactory : ICipheredStreamFactory
     /// <exception cref="ArgumentNullException"><paramref name="keyProvider"/> is null.</exception>
     public CipheredFileStreamFactory(IKeyProvider keyProvider)
     {
-        ArgumentNullException.ThrowIfNull(keyProvider);
+        ThrowHelper.ThrowIfNull(keyProvider, nameof(keyProvider));
         _keyProvider = keyProvider;
         _key = (byte[])keyProvider.GetKey().Clone();
     }
@@ -58,12 +58,12 @@ public sealed class CipheredFileStreamFactory : ICipheredStreamFactory
     /// <exception cref="EncryptedFileVersionException">The file version is not supported.</exception>
     public static FileHeaderInfo ReadFileHeader(string path)
     {
-        ArgumentException.ThrowIfNullOrEmpty(path);
+        ThrowHelper.ThrowIfNullOrEmpty(path, nameof(path));
 
-        Span<byte> header = stackalloc byte[EncryptedFileFormat.CleartextHeaderSize];
+        var header = new byte[EncryptedFileFormat.CleartextHeaderSize];
 
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        int bytesRead = fs.Read(header);
+        int bytesRead = fs.Read(header, 0, header.Length);
         if (bytesRead < EncryptedFileFormat.CleartextHeaderSize)
             throw EncryptedFileCorruptException.InvalidMagicBytes(path);
 
@@ -73,7 +73,7 @@ public sealed class CipheredFileStreamFactory : ICipheredStreamFactory
             throw EncryptedFileCorruptException.InvalidMagicBytes(path);
 
         // Validate version
-        ushort version = BinaryPrimitives.ReadUInt16LittleEndian(header[2..]);
+        ushort version = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(2));
         if (version > EncryptedFileFormat.MaxSupportedVersion)
             throw new EncryptedFileVersionException(version, EncryptedFileFormat.MaxSupportedVersion, path);
 
@@ -86,9 +86,9 @@ public sealed class CipheredFileStreamFactory : ICipheredStreamFactory
 
         if (kdfMethod == KdfMethod.Pbkdf2Sha256)
         {
-            salt = header.Slice(EncryptedFileFormat.SaltOffset, EncryptedFileFormat.SaltSize).ToArray();
+            salt = header.AsSpan(EncryptedFileFormat.SaltOffset, EncryptedFileFormat.SaltSize).ToArray();
             kdfIterations = BinaryPrimitives.ReadUInt32LittleEndian(
-                header[EncryptedFileFormat.KdfIterationsOffset..]);
+                header.AsSpan(EncryptedFileFormat.KdfIterationsOffset));
         }
 
         return new FileHeaderInfo
@@ -114,8 +114,8 @@ public sealed class CipheredFileStreamFactory : ICipheredStreamFactory
     public Stream Create(string path, FileMode mode, FileAccess access, FileShare share,
         CipheredFileStreamOptions? options = null)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        ArgumentException.ThrowIfNullOrEmpty(path);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
+        ThrowHelper.ThrowIfNullOrEmpty(path, nameof(path));
 
         options ??= new CipheredFileStreamOptions();
 
@@ -201,7 +201,7 @@ public sealed class CipheredFileStreamFactory : ICipheredStreamFactory
         {
             if (_key is not null)
             {
-                Array.Clear(_key);
+                Array.Clear(_key, 0, _key.Length);
                 _key = null;
             }
             _disposed = true;

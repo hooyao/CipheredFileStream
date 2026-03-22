@@ -302,7 +302,7 @@ public class ReadPositionMatrixAsyncUnitTests : CryptoTestBase
 
         // Read some bytes first to advance position
         var discard = new byte[100];
-        await stream.ReadAsync(discard, 0, discard.Length);
+        await stream.ReadExactlyAsync(discard, 0, discard.Length);
 
         // Seek back to a specific position using Begin
         int seekPos = layout.Block0DataCapacity + 200;
