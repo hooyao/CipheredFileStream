@@ -1,457 +1,885 @@
-# CipheredFileStream - Technical Design
+# CipheredFileStream -- Technical Design Document
+
+**Format version:** v3 (`0x0003`)
+**Document revision:** 2.0
+**Status:** Current implementation
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [File Format (v3)](#2-file-format-v3)
+3. [Cryptography](#3-cryptography)
+4. [Block Layout and Geometry](#4-block-layout-and-geometry)
+5. [IO Architecture](#5-io-architecture)
+6. [Key Management](#6-key-management)
+7. [Public API](#7-public-api)
+8. [Security Properties](#8-security-properties)
+9. [Performance](#9-performance)
+10. [Error Handling](#10-error-handling)
+11. [Extensibility](#11-extensibility)
+
+---
 
 ## 1. Overview
 
-CipheredFileStream is a `Stream` implementation that provides transparent AES-GCM encryption for files. It serves as a drop-in replacement for `FileStream`, encrypting data before writing to disk and decrypting on read. The design prioritizes:
+CipheredFileStream is a .NET `Stream` implementation that provides transparent
+block-level AES-256-GCM encryption for files. It serves as a drop-in replacement
+for `FileStream`; any code that operates on `Stream` works unchanged.
 
-- **Drop-in replacement** -- any code that works with `Stream` works with `CipheredFileStream`
-- **Random access performance** via chunked storage (all chunks same physical size)
-- **Data integrity** via AES-GCM authentication tags (per-chunk)
-- **File integrity** via XOR checksum (file-level)
-- **Format identification** via cleartext magic number (readable without key)
-- **Security** via AAD binding (block reordering detection)
+### Design goals
 
-## 2. File Format (v1)
+- **Drop-in Stream replacement** -- standard `Read`/`Write`/`Seek`/`SetLength`
+  semantics; no API leakage of encryption details.
+- **Block-level authenticated encryption** -- every block is independently
+  encrypted and authenticated with AES-GCM, including AAD binding to prevent
+  block reordering.
+- **File-level integrity** -- XOR of per-block GCM authentication tags provides
+  a lightweight file-wide integrity check.
+- **High throughput** -- parallel encrypt/decrypt with bulk IO via
+  WriteBehindBuffer and ReadAheadBuffer in sequential mode.
+- **Pluggable algorithms** -- new ciphers require only a new `IBlockCrypto`
+  implementation and a one-byte algorithm ID; the file format, block layout, and
+  IO pipeline are algorithm-agnostic.
+- **Secure key handling** -- all key material is defensively copied and zeroed on
+  dispose.
 
-Format version: `0x0001`. Magic bytes: `0x43 0x49 0x50 0x48 0x45 0x52 0x45 0x44` (ASCII `"CIPHERED"`).
+---
 
-### 2.1 Physical Layout
+## 2. File Format (v3)
 
-```
-+--------+--------+--------+--------+--------+--------+---
-|Chunk 0 |Chunk 1 |Chunk 2 |Chunk 3 |  ...   |Chunk N |
-|        |        |        |        |        |        |
-+--------+--------+--------+--------+--------+--------+---
-<-CS----> <-CS----> <-CS----> <-CS---->         <-CS---->
+### 2.1 Cleartext Header (32 bytes, fixed, unencrypted)
 
-CS = Chunk Size (configurable: 4K, 8K, 16K, 32K, 64K, 128K)
-All chunks are the same physical size.
-```
-
-### 2.2 Chunk 0 — Complete Structure
-
-Chunk 0 contains the file header and user data:
-
-**On-disk layout:**
-
-```
-CHUNK 0 — ON DISK (ChunkSize bytes)
-┌──────────────────┬────────────┬──────────────────────────────┬──────────┐
-│ Cleartext Header │  CT Length │        Ciphertext            │ Padding  │
-│     8 bytes      │  4 bytes   │  (encrypted envelope)        │ (zeros)  │
-│   UNENCRYPTED    │  uint32 LE │                              │          │
-└──────────────────┴────────────┴──────────────────────────────┴──────────┘
-│← byte [0..7] ──→│←[8..11]──→│←── [12..N] ────────────────→│←to CS──→│
-```
-
-**Cleartext header (bytes 0-7, readable without key):**
+The first 32 bytes of every file are always in the clear. They allow file
+identification, algorithm detection, and KDF parameter retrieval before any
+key material is needed.
 
 ```
-Offset  Size  Field                    Value
-------  ----  -----------------------  ---------------------------
-0       8B    Magic bytes              "CIPHERED" (ASCII)
+Offset  Size  Field            Encoding         Values / Notes
+------  ----  ---------------  ---------------  ---------------------------------
+ 0       2B   Magic            uint16 LE        0x4342 ("BC")
+ 2       2B   FormatVersion    uint16 LE        0x0003
+ 4       1B   BlockSizeExp     uint8            12..17 (4 KB .. 128 KB)
+ 5       1B   AlgorithmId      uint8            0x01 = AES-256-GCM
+ 6       1B   KdfMethod        uint8            0x00 = None, 0x01 = PBKDF2-SHA256
+ 7       1B   Reserved         ---              0x00
+ 8      16B   Salt             bytes            PBKDF2 salt (zeros when KdfMethod=None)
+24       4B   KdfIterations    uint32 LE        PBKDF2 iterations (0 when KdfMethod=None)
+28       4B   Reserved         ---              0x00000000
 ```
 
-**Encrypted payload (after decryption):**
+Total: **32 bytes**, always at file offset 0.
+
+### 2.2 Physical Block Layout
+
+All blocks have the same physical size (`BlockSize = 1 << BlockSizeExponent`).
+Block 0 shares space with the cleartext header; blocks N>=1 use the full block.
 
 ```
-DECRYPTED PAYLOAD
-┌────────────┬─────────────────────────────┬─────────────────────────────┐
-│ Hdr Len 2B │   Protobuf Header (fixed)   │         User Data           │
-│  uint16 LE │       (≤128 bytes)           │                             │
-└────────────┴─────────────────────────────┴─────────────────────────────┘
+FILE ON DISK
++==========+============+=====+============+
+| Block 0  |  Block 1   | ... |  Block N   |
++==========+============+=====+============+
+<--BS-----> <---BS-----> ...   <---BS------>
+
+BS = BlockSize (power of 2, 4 KB to 128 KB)
 ```
 
-The Protobuf header is padded to a fixed size (128 bytes max) to ensure the user data offset is constant. This prevents header size changes from shifting chunk positions.
-
-### 2.3 Chunk N (N ≥ 1)
-
-Middle chunks are simpler — no cleartext header, no Protobuf overhead.
+#### Block 0
 
 ```
-CHUNK N — ON DISK (ChunkSize bytes)
-┌────────────┬──────────────────────────────────────┬────────────────────┐
-│  CT Length  │              Ciphertext              │      Padding       │
-│  4 bytes    │        (encrypted envelope)          │      (zeros)       │
-│  uint32 LE  │                                      │                    │
-└────────────┴──────────────────────────────────────┴────────────────────┘
-│← [0..3] ─→│←──── [4..N] ───────────────────────→│←── to ChunkSize ─→│
+BLOCK 0 (BlockSize bytes)
++--------------------+------------+----------------------------+----------+
+| Cleartext Header   | CT Length  |        Ciphertext          | Padding  |
+|     32 bytes       |  4 bytes   |   (encrypted envelope)     | (zeros)  |
+|   UNENCRYPTED      | uint32 LE  |                            |          |
++--------------------+------------+----------------------------+----------+
+|<-- offset 0 ------>|<- 32 ----->|<-- 36 .. 36+ctLen-1 ----->|<- to BS->|
 ```
 
-After decryption, the entire payload is user data.
-
-### 2.4 Last Chunk — Partial Data
-
-The last chunk is physically identical to any other chunk (same ChunkSize). However, it may only be partially filled with real user data:
+#### Block N (N >= 1)
 
 ```
-LAST CHUNK — DECRYPTED PAYLOAD
-┌──────────────────────────────────┬─────────────────────────────────────┐
-│          Real User Data          │          Zero Padding               │
-│          (K bytes)               │    (PayloadCapacity - K bytes)      │
-└──────────────────────────────────┴─────────────────────────────────────┘
-│←── meaningful data ────────────→│←── zeros, encrypted but ignored ──→│
+BLOCK N (BlockSize bytes)
++------------+--------------------------------------+--------------------+
+| CT Length  |             Ciphertext               |      Padding       |
+|  4 bytes   |       (encrypted envelope)           |      (zeros)       |
+| uint32 LE  |                                      |                    |
++------------+--------------------------------------+--------------------+
+|<- 0..3 --->|<---- 4 .. 4+ctLen-1 --------------->|<-- to BlockSize -->|
 ```
 
-The entire chunk is always encrypted — the ciphertext size is constant regardless of how much real data the chunk holds. An observer cannot tell whether the last chunk contains 1 byte or is completely full.
+### 2.3 Ciphertext Envelope (AES-GCM)
 
-### 2.5 Header (Protobuf)
+Each ciphertext region contains the full AEAD envelope:
+
+```
+CIPHERTEXT ENVELOPE
++----------+--------------------+----------+
+|  Nonce   |    Ciphertext      | Auth Tag |
+| 12 bytes |  (plaintext size)  | 16 bytes |
++----------+--------------------+----------+
+
+Total overhead: 28 bytes per block (12 + 16)
+```
+
+### 2.4 Block 0 Decrypted Payload
+
+After decryption, the block 0 payload contains embedded file metadata followed
+by user data:
+
+```
+BLOCK 0 -- DECRYPTED PAYLOAD (PayloadCapacity bytes)
++----------+-----------------------------+-------------------------------+
+| Hdr Len  | Protobuf Header (reserved)  |          User Data            |
+| 2 bytes  |       85 bytes max          |                               |
+| uint16LE |                             |                               |
++----------+-----------------------------+-------------------------------+
+|<- 0..1 ->|<------ 2 .. 86 ----------->|<- 87 .. PayloadCapacity-1 --->|
+```
+
+- **Header length prefix** (2 bytes): actual serialized Protobuf length.
+- **Protobuf region** (85 bytes max): reserved space so that user data always
+  starts at a fixed offset (87) regardless of actual Protobuf serialization size.
+- **User data**: starts at byte 87, capacity = `PayloadCapacity - 87`.
+
+### 2.5 Protobuf Header Schema
 
 ```protobuf
 syntax = "proto3";
+package CipheredFileStream;
 
-message FileHeader {
-  ChunkSize chunk_size = 1;
-  bytes master_nonce = 2;      // 12 bytes, unique per file
-  KeyInfo key_info = 3;
-  bytes total_checksum = 4;    // XOR of all chunk checksums (32 bytes)
-}
-
-enum ChunkSize {
-  CHUNK_SIZE_4K = 0;    // 4096 bytes
-  CHUNK_SIZE_8K = 1;    // 8192 bytes
-  CHUNK_SIZE_16K = 2;   // 16384 bytes
-  CHUNK_SIZE_32K = 3;   // 32768 bytes
-  CHUNK_SIZE_64K = 4;   // 65536 bytes
-  CHUNK_SIZE_128K = 5;  // 131072 bytes
-}
-
-message KeyInfo {
-  KeyDerivation method = 1;
-  bytes salt = 2;          // for password-based derivation
-  uint32 iterations = 3;   // for PBKDF2
-}
-
-enum KeyDerivation {
-  KEY_DERIVATION_NONE = 0;     // raw key provided
-  KEY_DERIVATION_PBKDF2 = 1;
+message EncryptedFileHeader {
+    sfixed64 cleartext_length  = 1;  // logical file size in bytes
+    bytes    integrity_hash    = 2;  // XOR of per-block GCM tags (32 bytes)
+    sfixed32 block_count       = 3;  // total physical block count
+    sfixed32 header_version    = 4;  // header schema version (currently 1)
 }
 ```
 
-**Note:** `plaintext_length` and `chunk_count` are stored as fixed-size binary fields (12 bytes) after the Protobuf header, not inside Protobuf. This ensures the Protobuf header size never changes, avoiding chunk position shifts.
+Fixed-size types (`sfixed64`, `sfixed32`) are used for predictable serialized
+size. Maximum serialized size: 53 bytes (well within the 85-byte reservation).
 
-## 3. Encryption Details
+| Field              | Tag + Data  | Purpose                          |
+|--------------------|-------------|----------------------------------|
+| `cleartext_length` | 1 + 8 = 9B | Logical plaintext file size      |
+| `integrity_hash`   | 1+1+32=34B  | File-wide integrity checksum     |
+| `block_count`      | 1 + 4 = 5B  | Number of physical blocks        |
+| `header_version`   | 1 + 4 = 5B  | Schema version for future compat |
+| **Total max**      | **53 bytes**|                                  |
 
-### 3.1 Algorithm
+---
 
-- **Cipher**: AES-256-GCM (Galois/Counter Mode)
-- **Key size**: 256 bits (32 bytes)
-- **Nonce size**: 96 bits (12 bytes)
-- **Tag size**: 128 bits (16 bytes)
-- **Padding**: None (AES-GCM is a stream cipher mode)
-- **Hardware acceleration**: GHASH is accelerated via PCLMULQDQ instruction on modern CPUs
+## 3. Cryptography
 
-### 3.2 Why AES-GCM
+### 3.1 AES-256-GCM (AlgorithmId 0x01)
 
-AES-GCM provides both encryption and authentication in a single operation:
+| Parameter          | Value                                |
+|--------------------|--------------------------------------|
+| Cipher             | AES-256-GCM (Galois/Counter Mode)    |
+| Key size           | 256 bits (32 bytes)                  |
+| Nonce size         | 96 bits (12 bytes), random per block |
+| Auth tag size      | 128 bits (16 bytes)                  |
+| Ciphertext overhead| 28 bytes (12 nonce + 16 tag)         |
+| Padding            | None (CTR mode)                      |
+| HW acceleration    | AES-NI + PCLMULQDQ (GHASH)          |
 
-| Feature | AES-CBC + HMAC-SHA512 | AES-GCM |
-|---------|----------------------|---------|
-| Encryption | AES-CBC | AES-CTR |
-| Authentication | HMAC-SHA512 | GHASH (built-in) |
-| HW acceleration | AES-NI only | AES-NI + PCLMULQDQ |
-| Separate MAC needed | Yes | No |
-| Verify-before-decrypt | Required | Built-in |
-| Complexity | Higher | Lower |
+Each block encryption:
+1. Generate 12 random bytes (nonce) via `RandomNumberGenerator.Fill`.
+2. Encrypt plaintext with AES-GCM using the nonce and AAD.
+3. Write envelope: `[nonce][ciphertext][tag]`.
+4. Emit 32-byte integrity tag: GCM tag zero-padded to 32 bytes.
 
-AES-GCM is faster because GHASH has hardware acceleration, while HMAC-SHA512 does not.
-
-### 3.3 Key Management
-
-Two modes:
-
-1. **Raw key**: User provides 32-byte key directly
-2. **Password-based (PBKDF2)**:
-   - Derive key from password
-   - Salt: 16 bytes, stored in header
-   - Iterations: configurable (default 600,000)
-   - Hash: SHA-256
-
-### 3.4 Chunk Authentication
-
-- Each chunk is independently authenticated via AES-GCM tag
-- **AAD (Additional Authenticated Data)**: `chunk_index` (uint32, little-endian)
-- AAD binds each chunk to its position → swapping chunks detects tampering
-- Tamper detection at read: if tag verification fails, throw `CryptographicException`
-
-**Why AAD with chunk index works:**
-```
-Chunk 0 encrypted with AAD=0
-Chunk 1 encrypted with AAD=1
-...
-
-If chunk 0 and chunk 1 are swapped:
-  - Read at position 0 → decrypt chunk 1 with AAD=0 → tag mismatch (was encrypted with AAD=1)
-  - Read at position 1 → decrypt chunk 0 with AAD=1 → tag mismatch (was encrypted with AAD=0)
-```
-
-### 3.5 Integrity Verification (XOR Checksum)
-
-**Problem**: AES-GCM per-chunk auth cannot detect:
-- File-level corruption (truncation, extra chunks)
-
-**Solution**: XOR total checksum
-
-**Chunk Checksum:**
-- Algorithm: SHA-256
-- Input: `nonce (12) + ciphertext + auth_tag (16)`
-- Computed: each time chunk is written
-
-**Total Checksum (XOR):**
-- Algorithm: XOR all chunk checksums
-- `total = C0 XOR C1 XOR C2 XOR ... XOR CN`
-- Stored: in header `total_checksum` field (32 bytes)
-- Update O(1): `total = total XOR old_Ci XOR new_Ci`
-
-**Why XOR:**
-- O(1) update (vs O(n) for sequential hash)
-- Order-independent (commutative)
-- Detects any chunk modification
-
-**Update Flow:**
-```
-1. Compute chunk_checksum = SHA256(nonce + ciphertext + tag)
-2. Write chunk to disk
-3. Update total: header.total_checksum ^= chunk_checksum
-4. Write header
-```
-
-**Verification Flow (open file):**
-```
-1. Read header, get total_checksum
-2. Compute actual_total = XOR of all chunk checksums
-3. Verify: total_checksum == actual_total
-   → fails: file corrupted (chunks missing, added, or damaged)
-4. On each chunk read:
-   a. AES-GCM decrypt with AAD=chunk_index → fails if swapped/tampered
-```
-
-## 4. Random Access
-
-### 4.1 Seek Operation
+### 3.2 Additional Authenticated Data (AAD)
 
 ```
-chunk_index = position / chunk_size
-chunk_offset = position % chunk_size
+AAD = block_index as int64, little-endian (8 bytes)
 ```
 
-### 4.2 File Position Mapping
+The block index is included as AAD during both encryption and decryption. This
+binds each block's ciphertext to its position in the file:
 
-For plaintext position `P`:
+```
+Block 0 encrypted with AAD = 0x0000000000000000
+Block 1 encrypted with AAD = 0x0100000000000000
+Block N encrypted with AAD = N as int64 LE
 
-- **Chunk index**: `P / chunk_size`
-- **Offset within chunk**: `P % chunk_size`
-- **File position of chunk**: `chunk_index * chunk_total_size`
-  - Where `chunk_total_size = chunk_size` (all chunks same physical size)
+If an attacker swaps blocks 0 and 1:
+  Decrypt block 1 at position 0 with AAD=0 --> tag mismatch (was AAD=1)
+  Decrypt block 0 at position 1 with AAD=1 --> tag mismatch (was AAD=0)
+```
 
-### 4.3 Chunk Size Table
+### 3.3 Integrity Hash (File-Level)
 
-| Chunk Size | Physical Size | Payload Capacity | Overhead |
-|------------|---------------|------------------|----------|
-| 4K | 4,096 B | 4,048 B | 48 B (1.2%) |
-| 8K | 8,192 B | 8,144 B | 48 B (0.6%) |
-| 16K | 16,384 B | 16,336 B | 48 B (0.3%) |
-| 32K | 32,768 B | 32,720 B | 48 B (0.1%) |
-| 64K | 65,536 B | 65,488 B | 48 B (0.07%) |
-| 128K | 131,072 B | 131,024 B | 48 B (0.04%) |
+The file-level integrity hash is the XOR of all per-block integrity tags:
 
-Overhead per chunk: 12 (nonce) + 16 (tag) + 4 (length prefix) = 32 bytes + AES-GCM padding
+```
+integrity_hash = tag[0] XOR tag[1] XOR ... XOR tag[N]
+```
 
-### 4.4 Why 16K is Recommended Default
+Each `tag[i]` is the 16-byte GCM authentication tag zero-padded to 32 bytes.
 
-- **Crypto efficiency**: Larger chunks amortize per-chunk overhead
-- **Memory footprint**: 1MB buffer holds ~64 chunks at 16K
-- **Random access**: 16K is reasonable read amplification for single-byte reads
-- **Performance**: ~92% of theoretical crypto throughput ceiling
+**Properties of XOR integrity:**
+- O(1) update: `hash_new = hash_old XOR tag_old XOR tag_new`
+- Order-independent (commutative, associative)
+- Detects any single-block modification
+- Stored in the Protobuf header inside block 0
 
-## 5. Public API
+**IntegrityTracker operations:**
+- `UpdateIntegrity(blockIndex, newTag)`: XOR out old tag, XOR in new tag.
+- `RecordBlockHash(blockIndex, tag)`: cache tag without modifying running hash
+  (used during reads).
+- `RemoveBlock(blockIndex)`: XOR out tag contribution (used during truncation).
 
-### 5.1 CipheredFileStream Class
+### 3.4 Pluggable Crypto Architecture
+
+```
+                    IBlockCryptoFactory
+                    +-------------------+
+                    | DefaultAlgorithmId|
+                    | Create()          |---- creates ---> IBlockCrypto
+                    | CreateForAlgorithm|                  +-----------------+
+                    | GetCiphertextOvhd |                  | AlgorithmId     |
+                    +-------------------+                  | CiphertextOvhd  |
+                           ^                               | IntegrityTagSize|
+                           |                               | Encrypt()       |
+                    BlockCryptoFactory                      | Decrypt()       |
+                    (switch on AlgorithmId)                 +-----------------+
+                                                                  ^
+                                                                  |
+                                                           AesGcmBlockCrypto
+                                                           (AlgorithmId=0x01)
+```
+
+Adding a new algorithm:
+1. Implement `IBlockCrypto` with a new `AlgorithmId` byte.
+2. Add a case to `BlockCryptoFactory.CreateForAlgorithm()`.
+3. The rest of the stack (BlockLayout, BlockManager, WriteBehindBuffer,
+   ReadAheadBuffer) is algorithm-agnostic.
+
+**Thread safety:** `IBlockCrypto` instances are **not** thread-safe. Each
+parallel worker creates its own instance through the factory. Pre-allocated
+buffers (nonce, tag) are reused per call within a single worker.
+
+---
+
+## 4. Block Layout and Geometry
+
+### 4.1 BlockLayout Calculations
+
+`BlockLayout` computes all geometry from two inputs: block size exponent and
+ciphertext overhead.
+
+```
+BlockSize             = 1 << blockSizeExponent
+
+Block0MaxCT           = BlockSize - CleartextHeaderSize(32) - LengthPrefix(4)
+BlockNMaxCT           = BlockSize - LengthPrefix(4)
+
+PayloadCapacity       = Block0MaxCT - CiphertextOverhead
+                      (constrained by Block 0, not Block N)
+
+Block0DataStart       = HeaderLengthPrefix(2) + ProtobufMaxSize(85) = 87
+Block0DataCapacity    = PayloadCapacity - 87
+BlockNDataCapacity    = PayloadCapacity
+```
+
+**Key insight:** `PayloadCapacity` is derived from Block 0's smaller ciphertext
+budget so that all blocks share the same decrypted payload size. Block N wastes
+32 bytes (the cleartext header size) as unused padding at the end of its
+physical block -- this is the cost of uniform payload capacity.
+
+### 4.2 Capacity Table (AES-GCM, overhead = 28 bytes)
+
+| BlockSize   | Exponent | Block0MaxCT | PayloadCapacity | Block0DataCapacity | BlockNDataCapacity |
+|-------------|----------|-------------|-----------------|--------------------|--------------------|
+| 4 KB (4096) | 12       | 4060        | 4032            | 3945               | 4032               |
+| 8 KB (8192) | 13       | 8156        | 8128            | 8041               | 8128               |
+| 16 KB       | 14       | 16348       | 16320           | 16233              | 16320              |
+| 32 KB       | 15       | 32732       | 32704           | 32617              | 32704              |
+| 64 KB       | 16       | 65500       | 65472           | 65385              | 65472              |
+| 128 KB      | 17       | 131036      | 131008          | 130921             | 131008             |
+
+*Note: Block0MaxCT = BlockSize - 32 - 4. PayloadCapacity = Block0MaxCT - 28.*
+
+### 4.3 Position Mapping
+
+`PositionMapper` translates logical cleartext byte positions to
+`(blockIndex, offsetInPayload)`:
+
+```
+If cleartextPosition < Block0DataCapacity:
+    blockIndex = 0
+    offsetInPayload = Block0DataStart + cleartextPosition
+
+Else:
+    adjusted = cleartextPosition - Block0DataCapacity
+    blockIndex = 1 + adjusted / BlockNDataCapacity
+    offsetInPayload = adjusted % BlockNDataCapacity
+```
+
+Physical file offset for a block: `blockIndex * BlockSize`.
+
+Block count for a given cleartext length:
+
+```
+If length <= 0:                      0 blocks
+If length <= Block0DataCapacity:     1 block
+Else: 1 + ceil((length - Block0DataCapacity) / BlockNDataCapacity)
+```
+
+---
+
+## 5. IO Architecture
+
+### 5.1 Access Patterns
+
+CipheredFileStream supports two access patterns selected at creation time:
+
+```
+                          CipheredFileStream
+                                |
+              +-----------------+-----------------+
+              |                                   |
+         Sequential                          RandomAccess
+         (default)                           (explicit)
+              |                                   |
+    +---------+---------+                    BlockManager
+    |                   |                  (single-block cache)
+WriteBehindBuffer  ReadAheadBuffer
+ (bulk write)       (bulk read)
+    |                   |
+    +----> fallback --->+-----> BlockManager
+```
+
+**Sequential mode** (default) uses ring buffers for bulk IO with parallel
+encrypt/decrypt. It automatically falls back to BlockManager for operations
+that break sequential assumptions.
+
+**RandomAccess mode** uses BlockManager directly with a single-block cache.
+
+### 5.2 WriteBehindBuffer (Sequential Writes)
+
+Accumulates plaintext into block-sized slots, encrypts full slots in parallel,
+and writes them to disk in bulk.
+
+```
+USER WRITES
+    |
+    v
++-------+-------+-------+-------+
+| Slot 0| Slot 1| Slot 2| Slot 3|   (plaintext accumulation)
++-------+-------+-------+-------+
+    |       |       |       |
+    v       v       v       v        <-- Phase 1: Parallel Encrypt
++-------+-------+-------+-------+
+|  CT 0 |  CT 1 |  CT 2 |  CT 3 |   (ciphertext + tags in _rawBuffer)
++-------+-------+-------+-------+
+    |                               <-- Phase 2: Serial Integrity Update
+    v
+IntegrityTracker.UpdateIntegrity()   (per-slot, sequential)
+    |                               <-- Phase 3: Bulk IO Write
+    v
+_underlyingStream.Write(_rawBuffer)  (single system call)
+```
+
+**3-phase flush:**
+1. **Parallel encrypt**: workers partition slots, each encrypts independently
+   using its own `CryptoWorker` (IBlockCrypto + CtBuffer + AadBuffer + IntegrityTagBuffer).
+   Integrity tags are captured per-slot in thread-safe non-overlapping arrays.
+2. **Serial integrity update**: iterate slots sequentially, call
+   `IntegrityTracker.UpdateIntegrity()` for each.
+3. **Bulk IO write**: write the entire `_rawBuffer` to the underlying stream in
+   a single `Write` call.
+
+**Buffer sizing:** Default 1 MB. Slot count = `max(2, bufferSize / BlockSize)`.
+
+### 5.3 ReadAheadBuffer (Sequential Reads)
+
+Bulk-reads multiple contiguous blocks in a single IO operation, decrypts them
+in parallel, and serves subsequent `Read` calls from decrypted slots.
+
+```
+_underlyingStream.Read(_rawBuffer)   <-- Bulk IO Read (single system call)
+    |
+    v
++-------+-------+-------+-------+
+| Raw 0 | Raw 1 | Raw 2 | Raw 3 |   (raw ciphertext blocks)
++-------+-------+-------+-------+
+    |       |       |       |
+    v       v       v       v        <-- Parallel Decrypt
++-------+-------+-------+-------+
+| PT 0  | PT 1  | PT 2  | PT 3  |   (decrypted slots)
++-------+-------+-------+-------+
+    |
+    v
+IntegrityTracker.RecordBlockHash()   (per-slot, sequential)
+    |
+USER READS <--- serve from slots
+```
+
+### 5.4 BlockManager (Random Access / Fallback)
+
+Single-block cache for random access and as fallback from sequential mode:
+
+```
+EnsureBlock(blockIndex)
+    |
+    +-- cache hit? --> return (no IO)
+    |
+    +-- cache miss
+         |
+         +-- flush dirty cached block (encrypt + write)
+         |
+         +-- read new block from disk
+         |
+         +-- decrypt into _cachedPayload
+         |
+         +-- record integrity tag
+```
+
+### 5.5 CryptoWorker Structure
+
+Each parallel worker owns isolated, pre-allocated buffers:
 
 ```csharp
-/// <summary>
-/// A Stream implementation that provides transparent AES-GCM encryption for files.
-/// Files are encrypted and stored in chunks for efficient random access.
-/// </summary>
-public sealed class CipheredFileStream : Stream
+struct CryptoWorker : IDisposable
 {
-    // Construction with raw key
-    public CipheredFileStream(
-        string path,
-        FileMode mode,
-        FileAccess access,
-        ReadOnlySpan<byte> key,
-        ChunkSize chunkSize = ChunkSize.Size4K);
-
-    // Construction with password
-    public CipheredFileStream(
-        string path,
-        FileMode mode,
-        FileAccess access,
-        ReadOnlySpan<char> password,
-        ChunkSize chunkSize = ChunkSize.Size4K);
-
-    // Stream overrides
-    public override bool CanRead { get; }
-    public override bool CanSeek { get; }
-    public override bool CanWrite { get; }
-    public override long Length { get; }        // Plaintext length
-    public override long Position { get; set; }
-
-    public override int Read(byte[] buffer, int offset, int count);
-    public override int Read(Span<byte> buffer);
-    public override ValueTask<int> ReadAsync(
-        Memory<byte> buffer, CancellationToken cancellationToken = default);
-
-    public override void Write(byte[] buffer, int offset, int count);
-    public override void Write(ReadOnlySpan<byte> buffer);
-    public override ValueTask WriteAsync(
-        ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default);
-
-    public override long Seek(long offset, SeekOrigin origin);
-    public override void Flush();
-    public override Task FlushAsync(CancellationToken cancellationToken);
-    public override void SetLength(long value);
-
-    // Integrity verification
-    public void VerifyIntegrity();
-
-    // Disposal
-    protected override void Dispose(bool disposing);
-    public override ValueTask DisposeAsync();
-}
-
-public enum ChunkSize
-{
-    Size4K = 4096,
-    Size8K = 8192,
-    Size16K = 16384,
-    Size32K = 32768,
-    Size64K = 65536,
-    Size128K = 131072
+    IBlockCrypto Crypto;           // per-worker IBlockCrypto instance
+    byte[]       CtBuffer;         // ciphertext working buffer
+    byte[]       PtBuffer;         // plaintext working buffer (ReadAheadBuffer only)
+    byte[]       AadBuffer;        // 8-byte AAD (block index)
+    byte[]       IntegrityTagBuffer; // 32-byte integrity tag
 }
 ```
 
-### 5.2 Open Modes
+Workers are **not** shared between threads. The main thread uses `_workers[0]`;
+ThreadPool threads use `_workers[1..N-1]`.
 
-| FileMode | FileAccess | Behavior |
-|----------|-----------|----------|
-| Create | Write | Create new file, overwrite if exists |
-| CreateNew | Write | Create new file, fail if exists |
-| Open | Read | Open existing, read-only |
-| OpenOrCreate | ReadWrite | Open or create |
-| Append | Write | Open at end, write only |
+### 5.6 Fallback Mechanics
 
-## 6. Buffering & Performance
+Sequential mode falls back to BlockManager under these conditions:
 
-### 6.1 Buffer Pool
+| Trigger                         | Permanent? | Reason                                    |
+|---------------------------------|------------|-------------------------------------------|
+| Overwrite write (position < EOF)| Yes        | Cannot maintain sequential append model    |
+| `SetLength()`                   | Yes        | Structural file change                     |
+| `Seek`/Position setter          | No         | Flushes pending data, does not disable     |
+| Mid-block append after `Flush`  | Yes        | Block already has data that would be lost  |
 
-- Use `ArrayPool<byte>.Shared` for chunk buffers
-- Pre-allocate all crypto buffers in constructor (avoid GC pressure)
-- Avoid allocations in hot paths (Read/Write loops)
+**IsMidBlockAppend** detection: after `Flush`, if position is at EOF but in the
+middle of an existing block (i.e., `offsetInPayload != dataStart` and
+`blockIndex < blockCount`), WriteBehindBuffer would zero-initialize the slot and
+lose existing block data. This triggers permanent fallback.
 
-### 6.2 Cache Strategy
+---
 
-- Cache current chunk in memory (single-block cache)
-- On seek to different chunk: decrypt and cache new chunk
-- Write-back: flush cached chunk before loading new one
+## 6. Key Management
 
-### 6.3 Performance Characteristics
+### 6.1 Key Provider Hierarchy
 
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| Sequential read | O(n) | Single decryption per chunk |
-| Random read | O(1) | One chunk decryption per seek |
-| Sequential write | O(n) | Single encryption per chunk |
-| Random write | O(1) | Read-modify-write for partial chunk |
-| Seek | O(1) | Position calculation only |
-| Integrity update | O(1) | XOR of chunk checksums |
+```
+IKeyProvider : IDisposable
+    |-- GetKey() : byte[32]
+    |
+    +-- EphemeralKeyProvider       Random 32-byte key, zeroed on dispose
+    |
+    +-- PasswordKeyProvider        PBKDF2-SHA256 derived key
+```
 
-### 6.4 AES-GCM Performance
+### 6.2 Direct Key
 
-AES-GCM benefits from hardware acceleration:
-- **AES-NI**: Hardware AES encryption/decryption
-- **PCLMULQDQ**: Hardware GHASH authentication
-- **Combined**: ~400-500 MB/s throughput on modern CPUs
+```csharp
+var factory = new CipheredFileStreamFactory(keyBytes); // 32-byte key
+```
 
-Compared to AES-CBC + HMAC-SHA512 (~350 MB/s), AES-GCM is ~20-30% faster due to hardware-accelerated authentication.
+A defensive copy is made internally. The caller may clear the original. The
+factory zeroes its copy on `Dispose()`.
 
-## 6. Error Handling
+### 6.3 PBKDF2-SHA256 (Password-Based)
 
-### 6.1 Exceptions
+```csharp
+// New file: generates random 16-byte salt
+var provider = new PasswordKeyProvider("passphrase", iterations: 600_000);
 
-| Exception | Condition |
-|-----------|-----------|
-| `ArgumentException` | Invalid chunk size, key length |
-| `ArgumentNullException` | Null key/password |
-| `FileNotFoundException` | File not found on Open |
-| `InvalidOperationException` | Wrong FileMode for operation |
-| `ObjectDisposedException` | Access after disposal |
-| `CryptographicException` | AES-GCM auth failed (tampered/swapped chunk) |
-| `InvalidDataException` | Total checksum mismatch (file integrity failure) |
-| `EndOfStreamException` | Read beyond end |
-| `IOException` | Underlying I/O errors |
+// Existing file: use salt and iterations from file header
+var header = CipheredFileStreamFactory.ReadFileHeader("file.enc");
+var provider = new PasswordKeyProvider("passphrase", header.Salt, header.KdfIterations);
+```
 
-### 6.2 Tamper Detection
+| Parameter  | Value                               |
+|------------|-------------------------------------|
+| Algorithm  | PBKDF2 with HMAC-SHA256             |
+| Salt       | 16 bytes, cryptographically random  |
+| Iterations | Default 600,000 (configurable)      |
+| Output     | 32 bytes (AES-256 key)              |
 
-When reading a chunk:
-1. Derive expected nonce from chunk index
-2. Attempt AES-GCM decryption with AAD = chunk_index
-3. If tag verification fails → throw `CryptographicException`
-   - Chunk data tampered, or chunk swapped to different position
+KDF parameters (method, salt, iterations) are stored in the cleartext header
+so they can be read before any key material is available.
 
-### 6.3 Full File Verification
+### 6.4 Ephemeral Keys
 
-When opening a file:
-1. Read header, get total_checksum
-2. For each chunk, compute `SHA256(nonce + ciphertext + tag)`, XOR into running total
-3. Verify: `total_checksum == computed_total`
-4. If mismatch → throw `InvalidDataException` (chunks missing, added, or corrupted)
+```csharp
+using var provider = new EphemeralKeyProvider(); // random 32-byte key
+```
 
-## 7. Security Properties
+Generates a random key on construction. Useful for temporary/session-scoped
+encrypted files. Key is zeroed on dispose.
 
-### 7.1 What IS Guaranteed
+### 6.5 Header Inspection
 
-| Property | Mechanism |
-|----------|-----------|
-| **Confidentiality** | AES-256-GCM with per-chunk nonce |
-| **Per-chunk authentication** | AES-GCM tag (128-bit) |
-| **Chunk reordering detection** | AAD = chunk_index (swapped chunks fail auth) |
-| **Tamper detection** | Any modification to ciphertext/nonce/tag is detected |
-| **Wrong key detection** | GCM auth fails immediately with wrong key |
-| **File-level integrity** | XOR of SHA-256 chunk checksums |
-| **Key zeroing on dispose** | Sensitive buffers cleared via `Array.Clear` |
+```csharp
+FileHeaderInfo header = CipheredFileStreamFactory.ReadFileHeader("file.enc");
+// header.KdfMethod, header.Salt, header.KdfIterations, header.AlgorithmId, ...
+```
 
-### 7.2 What is NOT Guaranteed
+`ReadFileHeader` is a static utility that reads only the 32-byte cleartext
+header. It validates magic bytes and version but requires no key. This enables
+a two-phase open workflow: inspect header first, then provide the correct key
+or password.
 
-| Non-property | Reason |
-|--------------|--------|
-| **File truncation detection** | Attacker could remove trailing chunks (chunk_count in header helps but header itself could be modified) |
-| **Hiding file size** | Number of chunks reveals approximate size |
-| **Thread safety** | Not thread-safe, same as `FileStream` |
-| **Atomic writes** | Crash during write can leave partial state |
+---
 
-### 7.3 Why AES-GCM is Secure
+## 7. Public API
 
-AES-GCM provides built-in verify-before-decrypt:
-1. GHASH computes authentication tag over ciphertext + AAD
-2. Tag is compared before decryption begins
-3. If tag mismatch, decryption is never attempted
-4. This prevents padding oracle and chosen-ciphertext attacks
+### 7.1 Factory Pattern
 
-No separate verify step needed — it's built into the algorithm.
+```csharp
+public interface ICipheredStreamFactory : IDisposable
+{
+    Stream Create(string path, FileMode mode,
+                  CipheredFileStreamOptions? options = null);
+    Stream Create(string path, FileMode mode, FileAccess access,
+                  CipheredFileStreamOptions? options = null);
+    Stream Create(string path, FileMode mode, FileAccess access,
+                  FileShare share, CipheredFileStreamOptions? options = null);
+}
+```
 
-## 8. Thread Safety
+The concrete implementation is `CipheredFileStreamFactory`:
 
-- **Not thread-safe** by default (matches `FileStream` behavior)
-- Concurrent reads from different instances: safe (OS file sharing)
-- Concurrent read+write: undefined behavior, caller must synchronize
+```csharp
+// Direct key
+var factory = new CipheredFileStreamFactory(keyBytes);
 
-## 9. Future Considerations
+// Key provider (password or ephemeral)
+var factory = new CipheredFileStreamFactory(keyProvider);
 
-- Factory pattern (`CipheredFileStreamFactory`) for cleaner API
-- Sequential mode with ring buffers for bulk IO
-- Random access mode with single-block cache
-- Compression before encryption (opt-in)
-- Key rotation without re-encrypting entire file
-- Ephemeral key provider for temporary files
+// Static header inspection
+FileHeaderInfo info = CipheredFileStreamFactory.ReadFileHeader(path);
+```
+
+The factory returns a standard `Stream`. The internal `CipheredFileStream`
+class is not publicly exposed.
+
+### 7.2 CipheredFileStreamOptions
+
+```csharp
+public class CipheredFileStreamOptions
+{
+    BlockSizeOption      BlockSize        { get; set; } = Block16K;
+    AccessPattern        AccessPattern    { get; set; } = Sequential;
+    int                  BufferSize       { get; set; } = 0;      // 0 = default (1 MB)
+    int                  ConcurrencyLevel { get; set; } = 0;      // 0 = default (2)
+    EncryptionAlgorithm  Algorithm        { get; set; } = AesGcm;
+}
+```
+
+| Option           | Values                                 | Notes                                     |
+|------------------|----------------------------------------|-------------------------------------------|
+| `BlockSize`      | `Block4K` .. `Block128K` (enum)        | For new files only; existing files use header |
+| `AccessPattern`  | `Sequential`, `RandomAccess`           | Selects IO strategy                       |
+| `BufferSize`     | 0 or positive int                      | Ring buffer size (sequential mode)        |
+| `ConcurrencyLevel`| 0..N                                  | 0=default(2), 1=serial, capped at CPU count |
+| `Algorithm`      | `AesGcm` (0x01)                        | For new files only; existing files auto-detect |
+
+### 7.3 Enumerations
+
+```csharp
+public enum BlockSizeOption      // Exponents 12..17
+{
+    Block4K = 12, Block8K = 13, Block16K = 14,
+    Block32K = 15, Block64K = 16, Block128K = 17
+}
+
+public enum AccessPattern        { Sequential, RandomAccess }
+public enum EncryptionAlgorithm : byte { AesGcm = 0x01 }
+public enum KdfMethod : byte     { None = 0x00, Pbkdf2Sha256 = 0x01 }
+```
+
+### 7.4 Key Providers
+
+```csharp
+public interface IKeyProvider : IDisposable
+{
+    byte[] GetKey();  // returns 32-byte key
+}
+
+public sealed class EphemeralKeyProvider : IKeyProvider { ... }
+public sealed class PasswordKeyProvider  : IKeyProvider
+{
+    const int DefaultIterations = 600_000;
+    byte[] Salt { get; }
+    uint Iterations { get; }
+}
+```
+
+### 7.5 FileHeaderInfo
+
+```csharp
+public readonly struct FileHeaderInfo
+{
+    ushort    FormatVersion     { get; init; }
+    int       BlockSizeExponent { get; init; }
+    byte      AlgorithmId       { get; init; }
+    KdfMethod KdfMethod         { get; init; }
+    byte[]?   Salt              { get; init; }  // null when KdfMethod=None
+    uint      KdfIterations     { get; init; }  // 0 when KdfMethod=None
+}
+```
+
+### 7.6 Stream Behavior
+
+The returned `Stream` supports:
+
+| Operation          | Behavior                                              |
+|--------------------|-------------------------------------------------------|
+| `Read`/`ReadAsync` | Decrypt and return plaintext                          |
+| `Write`/`WriteAsync`| Encrypt and write ciphertext                         |
+| `Seek`             | Flush pending data, reposition                        |
+| `Position` setter  | Flush pending data, reposition                        |
+| `SetLength`        | Truncate or extend with zeros; permanent fallback     |
+| `Flush`            | Write all pending data and update header               |
+| `Dispose`          | Flush, dispose underlying stream, zero key material   |
+| `Length`            | Returns logical cleartext file size                   |
+
+File modes `Create`, `CreateNew`, `Truncate`, and `OpenOrCreate` (empty file)
+initialize a new encrypted file. `Open` and `OpenOrCreate` (existing file) read
+the header and auto-detect block size and algorithm. `Append` is converted to
+`OpenOrCreate` + `ReadWrite` with position set to EOF.
+
+Write-only access (`FileAccess.Write`) is automatically promoted to
+`FileAccess.ReadWrite` because the stream must read/write block headers.
+
+---
+
+## 8. Security Properties
+
+### 8.1 Guarantees
+
+| Property                        | Mechanism                                      |
+|---------------------------------|------------------------------------------------|
+| Confidentiality                 | AES-256-GCM with per-block random 12-byte nonce|
+| Per-block authentication        | GCM auth tag (128-bit) verified on every read  |
+| Block reordering detection      | AAD = block index (int64 LE)                   |
+| File-level integrity            | XOR of per-block GCM tags (32 bytes)           |
+| Wrong key detection             | GCM auth fails immediately                     |
+| Key zeroing on dispose          | `Array.Clear` on all key material              |
+| Verify-before-decrypt           | Built into GCM (tag check precedes decryption) |
+
+### 8.2 Non-Guarantees
+
+| Non-property                    | Reason                                          |
+|---------------------------------|-------------------------------------------------|
+| Block truncation detection      | Attacker can remove trailing blocks; block_count in header helps but header can be tampered |
+| File size hiding                | Number of blocks reveals approximate plaintext size |
+| Thread safety                   | Not thread-safe; matches `FileStream` contract  |
+| Atomic writes                   | Crash during write can leave partial state       |
+
+### 8.3 Nonce Management
+
+Each block uses a fresh 12-byte random nonce generated by
+`RandomNumberGenerator.Fill()`. Nonces are not derived from block indices or
+counters. With 2^96 possible nonces and random selection, the birthday bound
+for collision is approximately 2^48 encryptions -- far beyond practical use for
+file-level encryption.
+
+### 8.4 Disposal and Key Hygiene
+
+On `Dispose()` / `DisposeAsync()`:
+1. Flush all pending writes.
+2. Dispose `ReadAheadBuffer` and `WriteBehindBuffer` (zeroes all internal buffers).
+3. Dispose `BlockManager` (zeroes cached payload, ciphertext, plaintext buffers).
+4. Dispose underlying `FileStream`.
+5. `Array.Clear(_key)` -- zero the local key copy.
+
+`CipheredFileStreamFactory.Dispose()` zeroes its key copy.
+`PasswordKeyProvider.Dispose()` zeroes the derived key.
+`EphemeralKeyProvider.Dispose()` zeroes the random key.
+
+---
+
+## 9. Performance
+
+### 9.1 Measured Throughput
+
+Sequential read/write throughput measured with AES-GCM, parallel workers,
+1 MB buffer (default settings):
+
+| Block Size | Write (MB/s) | Read (MB/s) |
+|------------|--------------|-------------|
+| 4 KB       | 382          | 1,843       |
+| 8 KB       | 770          | 2,701       |
+| 16 KB      | 1,139        | 3,067       |
+| 32 KB      | 1,672        | 2,600       |
+| 64 KB      | 2,072        | 3,147       |
+| 128 KB     | 2,361        | 3,135       |
+
+### 9.2 Performance Architecture
+
+```
+                     Sequential Write Pipeline
+                     =========================
+
+User Write() calls
+        |
+        v
+  +-------------------+
+  | WriteBehindBuffer  |  Accumulate plaintext into slots
+  | (ring buffer)      |
+  +-------------------+
+        |  buffer full
+        v
+  +-------------------+
+  | Phase 1: Encrypt  |  Parallel (ThreadPool workers)
+  | N slots / M cores |  Each worker: own IBlockCrypto + buffers
+  +-------------------+
+        |  all slots encrypted
+        v
+  +-------------------+
+  | Phase 2: Integrity|  Serial (IntegrityTracker.UpdateIntegrity)
+  | N tag updates     |  O(1) per block (XOR)
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Phase 3: Bulk IO  |  Single Stream.Write() for N blocks
+  +-------------------+
+
+                     Sequential Read Pipeline
+                     ========================
+
+  +-------------------+
+  | Phase 1: Bulk IO  |  Single Stream.Read() for N blocks
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Phase 2: Decrypt  |  Parallel (ThreadPool workers)
+  | N slots / M cores |
+  +-------------------+
+        |
+        v
+  +-------------------+
+  | Phase 3: Record   |  Serial (IntegrityTracker.RecordBlockHash)
+  +-------------------+
+        |
+        v
+User Read() calls served from decrypted slots
+```
+
+### 9.3 Parallelism Model
+
+- Workers are partitioned across slots: `partition_size = slots / concurrency`.
+- Main thread processes partition 0; ThreadPool threads process partitions 1..N-1.
+- `Volatile.Read`/`Volatile.Write` on an abort flag enables early termination.
+- `Monitor.Wait`/`Pulse` synchronizes worker completion.
+- Parallelism is skipped when `slots < concurrency * 2` (overhead not worthwhile).
+- Concurrency is capped at `Environment.ProcessorCount`.
+- Default concurrency: 2 workers.
+
+### 9.4 Why 16K is the Recommended Default
+
+- **Crypto efficiency**: larger blocks amortize the 28-byte/block AES-GCM
+  overhead (0.17% at 16K vs 0.68% at 4K).
+- **Memory footprint**: 1 MB buffer holds ~62 slots at 16K.
+- **Random access**: 16K is reasonable read amplification for random single-byte
+  reads.
+- **Throughput**: 1,139 MB/s write, 3,067 MB/s read -- good balance without the
+  diminishing returns of very large blocks.
+
+---
+
+## 10. Error Handling
+
+### 10.1 Exception Types
+
+| Exception                         | Condition                                           |
+|-----------------------------------|-----------------------------------------------------|
+| `EncryptedFileCorruptException`   | Magic bytes invalid, ciphertext length invalid, GCM auth failure, integrity mismatch |
+| `EncryptedFileVersionException`   | File format version newer than supported            |
+| `ArgumentException`               | Invalid key length, empty password, bad salt size   |
+| `ArgumentOutOfRangeException`     | Invalid block size exponent, negative position      |
+| `ObjectDisposedException`         | Access after Dispose                                |
+| `NotSupportedException`           | Read on write-only, write on read-only              |
+| `EndOfStreamException`            | Truncated block on disk                             |
+| `IOException`                     | Underlying IO errors, negative seek                 |
+| `InvalidOperationException`       | Encryption failure, protobuf header too large       |
+
+### 10.2 EncryptedFileCorruptException
+
+```csharp
+public class EncryptedFileCorruptException : Exception
+{
+    int?    BlockIndex { get; }   // block where corruption detected
+    string? FilePath   { get; }   // file path, if known
+
+    static BlockAuthenticationFailed(int blockIndex, string? filePath);
+    static InvalidMagicBytes(string? filePath);
+    static IntegrityHashMismatch(string? filePath);
+}
+```
+
+### 10.3 EncryptedFileVersionException
+
+```csharp
+public class EncryptedFileVersionException : Exception
+{
+    ushort  FileVersion        { get; }  // version in file
+    ushort  MaxSupportedVersion { get; } // max this library supports
+    string? FilePath           { get; }
+}
+```
+
+---
+
+## 11. Extensibility
+
+### 11.1 Adding a New Encryption Algorithm
+
+1. Choose an unused algorithm ID byte (e.g., `0x02`).
+2. Implement `IBlockCrypto`:
+   - `AlgorithmId` -- return the new byte.
+   - `CiphertextOverhead` -- nonce + tag + any padding overhead.
+   - `IntegrityTagSize` -- always 32 bytes (zero-pad if native tag is smaller).
+   - `Encrypt()` / `Decrypt()` -- envelope format is implementation-defined.
+   - Pre-allocate all buffers in the constructor. Instance is **not** thread-safe.
+3. Add a case to `BlockCryptoFactory`:
+   - `CreateForAlgorithm()` -- instantiate the new class.
+   - `GetCiphertextOverhead()` -- return the overhead constant.
+4. Optionally add a new `EncryptionAlgorithm` enum value for the public API.
+
+No changes are needed to `BlockLayout`, `BlockManager`, `WriteBehindBuffer`,
+`ReadAheadBuffer`, `IntegrityTracker`, `PositionMapper`, or `CipheredFileStream`.
+The file format accommodates new algorithms via the `AlgorithmId` byte in the
+cleartext header.
+
+### 11.2 Adding a New KDF Method
+
+1. Choose an unused `KdfMethod` byte (e.g., `0x02` for Argon2).
+2. Implement a new `IKeyProvider` that derives a 32-byte key.
+3. Update `CipheredFileStreamFactory` to detect the new provider type and write
+   the appropriate `KdfMethod` byte and parameters to the cleartext header.
+4. Allocate any new header fields from the 4 reserved bytes (offsets 28-31).
+
+### 11.3 Format Version Compatibility
+
+The cleartext header contains `FormatVersion` and `MaxSupportedVersion`:
+- Files with `version < FormatVersion` are rejected (too old).
+- Files with `version > MaxSupportedVersion` are rejected (too new).
+- Currently both are `0x0003`.
+
+Future format changes increment `FormatVersion`. Older libraries reject newer
+files with `EncryptedFileVersionException`, which includes both the file version
+and the max supported version for diagnostic clarity.
