@@ -194,7 +194,7 @@ public class IOPerformanceTests : CryptoTestBase
             {
                 long pos = (long)(rng.NextDouble() * maxPos);
                 stream.Seek(pos, SeekOrigin.Begin);
-                stream.Read(buffer, 0, readSize);
+                stream.ReadExactly(buffer, 0, readSize);
             }
         }
         sw.Stop();
@@ -283,7 +283,7 @@ public class IOPerformanceTests : CryptoTestBase
                 stream.Seek(pos, SeekOrigin.Begin);
 
                 if (rng.NextDouble() < 0.7)
-                    stream.Read(readBuf, 0, ioSize);
+                    stream.ReadExactly(readBuf, 0, ioSize);
                 else
                     stream.Write(writeBuf, 0, ioSize);
             }
@@ -394,11 +394,11 @@ public class IOPerformanceTests : CryptoTestBase
             {
                 // Read from block 0
                 stream.Seek(0, SeekOrigin.Begin);
-                stream.Read(buffer, 0, buffer.Length);
+                stream.ReadExactly(buffer, 0, buffer.Length);
 
                 // Read from block 9
                 stream.Seek(block9Offset, SeekOrigin.Begin);
-                stream.Read(buffer, 0, buffer.Length);
+                stream.ReadExactly(buffer, 0, buffer.Length);
             }
         }
         sw.Stop();

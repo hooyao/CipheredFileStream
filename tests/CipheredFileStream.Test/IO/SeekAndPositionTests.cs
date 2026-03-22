@@ -37,7 +37,7 @@ public class SeekAndPositionTests : CryptoTestBase
             s.Write(data, 0, data.Length);
 
         using var stream = _factory.Create(path, FileMode.Open, FileAccess.Read, options);
-        stream.Read(new byte[100], 0, 100); // read 100 bytes
+        stream.ReadExactly(new byte[100], 0, 100); // read 100 bytes
         stream.Position.Should().Be(100);
 
         stream.Seek(50, SeekOrigin.Current);
