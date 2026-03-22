@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package CipheredFileStream;
+
+option csharp_namespace = "CipheredFileStream.IO.Protos";
+
+// Encrypted file header metadata stored in block 0's decrypted payload.
+// Uses fixed-size types (sfixed64, sfixed32) for predictable serialized size.
+// Max serialized size: 53 bytes; reserved at 85 bytes in block 0 payload.
+//   - sfixed64 cleartext_length:  1 (tag) + 8 (data) =  9 bytes
+//   - bytes integrity_hash:       1 (tag) + 1 (len) + 32 (data) = 34 bytes
+//   - sfixed32 block_count:       1 (tag) + 4 (data) =  5 bytes
+//   - sfixed32 header_version:    1 (tag) + 4 (data) =  5 bytes
+message EncryptedFileHeader {
+    // Logical cleartext file size in bytes
+    sfixed64 cleartext_length = 1;
+
+    // XOR of per-block integrity tags (32 bytes)
+    bytes integrity_hash = 2;
+
+    // Total number of physical blocks in the file
+    sfixed32 block_count = 3;
+
+    // Header schema version
+    sfixed32 header_version = 4;
+}
