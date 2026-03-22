@@ -20,7 +20,7 @@ public sealed class EphemeralKeyProvider : IKeyProvider
 
     public byte[] GetKey()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ThrowHelper.ThrowIfDisposed(_disposed, this);
         return _key;
     }
 
@@ -28,7 +28,7 @@ public sealed class EphemeralKeyProvider : IKeyProvider
     {
         if (!_disposed)
         {
-            Array.Clear(_key);
+            Array.Clear(_key, 0, _key.Length);
             _disposed = true;
         }
     }

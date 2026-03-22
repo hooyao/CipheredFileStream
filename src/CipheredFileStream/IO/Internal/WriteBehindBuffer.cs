@@ -327,9 +327,9 @@ internal sealed class WriteBehindBuffer : IDisposable
     {
         foreach (ref var w in _workers.AsSpan())
             w.Dispose();
-        Array.Clear(_rawBuffer);
+        Array.Clear(_rawBuffer, 0, _rawBuffer.Length);
         for (int i = 0; i < _slots.Length; i++)
-            Array.Clear(_slots[i]);
+            Array.Clear(_slots[i], 0, _slots[i].Length);
     }
 
     private struct CryptoWorker : IDisposable
@@ -350,8 +350,8 @@ internal sealed class WriteBehindBuffer : IDisposable
         public void Dispose()
         {
             Crypto?.Dispose();
-            if (CtBuffer != null) Array.Clear(CtBuffer);
-            if (IntegrityTagBuffer != null) Array.Clear(IntegrityTagBuffer);
+            if (CtBuffer != null) Array.Clear(CtBuffer, 0, CtBuffer.Length);
+            if (IntegrityTagBuffer != null) Array.Clear(IntegrityTagBuffer, 0, IntegrityTagBuffer.Length);
         }
     }
 }

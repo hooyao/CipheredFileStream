@@ -92,12 +92,12 @@ internal sealed class BlockManager : IDisposable
             _underlyingStream.Position = physicalOffset + EncryptedFileFormat.CleartextHeaderSize;
 
         // Read ciphertext length prefix
-        Span<byte> lengthBytes = stackalloc byte[_layout.CiphertextLengthPrefixSize];
-        int lengthRead = _underlyingStream.Read(lengthBytes);
+        var lengthArray = new byte[_layout.CiphertextLengthPrefixSize];
+        int lengthRead = _underlyingStream.Read(lengthArray, 0, lengthArray.Length);
         if (lengthRead < _layout.CiphertextLengthPrefixSize)
             throw new EndOfStreamException($"Failed to read ciphertext length for block {blockIndex}.");
 
-        int ciphertextLength = (int)BitConverter.ToUInt32(lengthBytes);
+        int ciphertextLength = (int)BitConverter.ToUInt32(lengthArray, 0);
         int maxCiphertextSize = blockIndex == 0 ? _layout.Block0MaxCiphertextSize : _layout.BlockNMaxCiphertextSize;
         if (ciphertextLength == 0 || ciphertextLength > maxCiphertextSize)
             throw new EncryptedFileCorruptException($"Invalid ciphertext length {ciphertextLength} for block {blockIndex}.", blockIndex, _filePath);
@@ -151,9 +151,9 @@ internal sealed class BlockManager : IDisposable
             _underlyingStream.Position = physicalOffset;
 
         // Length prefix
-        Span<byte> lengthBytes = stackalloc byte[4];
+        var lengthBytes = new byte[4];
         BitConverter.TryWriteBytes(lengthBytes, (uint)ciphertextLength);
-        _underlyingStream.Write(lengthBytes);
+        _underlyingStream.Write(lengthBytes, 0, lengthBytes.Length);
 
         // Ciphertext
         _underlyingStream.Write(_ciphertextBuffer, 0, ciphertextLength);
@@ -202,9 +202,9 @@ internal sealed class BlockManager : IDisposable
     public void Dispose()
     {
         _crypto.Dispose();
-        Array.Clear(_cachedPayload);
-        Array.Clear(_plaintextBuffer);
-        Array.Clear(_ciphertextBuffer);
-        Array.Clear(_integrityTagBuffer);
+        Array.Clear(_cachedPayload, 0, _cachedPayload.Length);
+        Array.Clear(_plaintextBuffer, 0, _plaintextBuffer.Length);
+        Array.Clear(_ciphertextBuffer, 0, _ciphertextBuffer.Length);
+        Array.Clear(_integrityTagBuffer, 0, _integrityTagBuffer.Length);
     }
 }
