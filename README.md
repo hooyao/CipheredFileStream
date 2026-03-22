@@ -4,17 +4,21 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
 
-Drop-in `System.IO.Stream` replacement with transparent AES-GCM block-level encryption, pluggable algorithm architecture, and hardware-accelerated performance.
+**Block-based encrypted file stream for .NET with full random read/write support.**
+
+Unlike whole-file encryption (where you must decrypt everything, modify, then re-encrypt the entire file), CipheredFileStream encrypts data in independent fixed-size blocks. This means you can seek to any position and read or write just the blocks you need — the rest of the file stays untouched on disk. This makes it practical for large files, databases, logs, or any scenario where you need encrypted storage with random access.
 
 ## Features
 
-- **Transparent encryption** -- reads and writes through a standard `Stream` interface
+- **Block-level encryption** -- each block encrypted independently; read/write any part without touching the rest
+- **Full random access** -- seek, overwrite, and read at arbitrary positions, just like a regular `FileStream`
+- **Drop-in `Stream` replacement** -- standard `System.IO.Stream` interface, works with any code that uses streams
 - **AES-256-GCM** with hardware acceleration (AES-NI + PCLMULQDQ)
 - **Pluggable crypto** via `IBlockCrypto` / `IBlockCryptoFactory` -- adding a new algorithm is one class + one switch case
 - **Configurable block sizes** from 4 KB to 128 KB (default 16 KB)
-- **Two access patterns**: Sequential (ring buffers, parallel crypto) and RandomAccess (single-block cache)
+- **Two access patterns**: Sequential (ring buffers, parallel crypto) and RandomAccess (single-block cache), with automatic fallback
 - **PBKDF2-SHA256** password-based key derivation (configurable iterations, default 600K)
-- **File-level integrity** via XOR of per-block GCM authentication tags
+- **Per-block integrity** via GCM authentication tags + XOR-based file-level integrity tracking
 - **Block reordering detection** via AAD binding (block index as authenticated data)
 - **Key material zeroed on dispose**
 
@@ -61,23 +65,58 @@ var options = new CipheredFileStreamOptions
 };
 ```
 
+### Random access
+
+```csharp
+var options = new CipheredFileStreamOptions { AccessPattern = AccessPattern.RandomAccess };
+using var factory = new CipheredFileStreamFactory(key, options);
+using Stream stream = factory.Create("data.enc", FileMode.Open, FileAccess.ReadWrite);
+
+// Seek to any position and read/write — only the affected block(s) are decrypted/encrypted
+stream.Position = 1_000_000;
+stream.Write(patch, 0, patch.Length);
+
+stream.Position = 500_000;
+stream.Read(buffer, 0, buffer.Length);
+```
+
 ## Performance
 
-Sequential access pattern, measured on hardware with AES-NI support.
+Measured on hardware with AES-NI support, 256 MB payload, default 16 KB block size.
 
-<details>
-<summary>Throughput by block size</summary>
+### Sequential throughput (ring buffers + parallel crypto)
 
 | Block Size | Write (MB/s) | Read (MB/s) |
 |:----------:|:------------:|:-----------:|
-| 4 KB       | 382          | 1,843       |
-| 8 KB       | 770          | 2,701       |
-| 16 KB      | 1,139        | 3,067       |
-| 32 KB      | 1,672        | 2,600       |
-| 64 KB      | 2,072        | 3,147       |
-| 128 KB     | 2,361        | 3,135       |
+| 4 KB       | 321          | 1,190       |
+| 8 KB       | 555          | 1,860       |
+| 16 KB      | 837          | 2,271       |
+| 32 KB      | 1,089        | 2,437       |
+| 64 KB      | 1,135        | 2,462       |
+| 128 KB     | 1,243        | 2,293       |
 
-</details>
+### Random access (single-block cache)
+
+| Workload                       | Result         |
+|:-------------------------------|:--------------:|
+| Random 4 KB read (10K ops)     | 56,231 IOPS    |
+| Random 4 KB write (10K ops)    | 26,359 IOPS    |
+| Mixed 70/30 read/write (10K ops) | 38,409 IOPS |
+| Block thrashing (alternating)  | 66,211 IOPS    |
+| Avg random read latency        | 17.8 μs        |
+
+### Sequential vs RandomAccess read comparison
+
+| Block Size | Sequential (MB/s) | RandomAccess (MB/s) | Ratio |
+|:----------:|:------------------:|:-------------------:|:-----:|
+| 4 KB       | 1,382              | 551                 | 2.51x |
+| 8 KB       | 1,840              | 894                 | 2.06x |
+| 16 KB      | 1,974              | 1,361               | 1.45x |
+| 32 KB      | 2,106              | 1,574               | 1.34x |
+| 64 KB      | 1,932              | 1,922               | 1.01x |
+| 128 KB     | 1,966              | 1,854               | 1.06x |
+
+> With large block sizes, random access reads approach sequential speed since each block read amortizes the syscall overhead.
 
 ## File Format (v3)
 
